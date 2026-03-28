@@ -41,7 +41,7 @@ The skill then asks 2–3 targeted questions based on what it found (loops, high
 
 ## Requirements
 
-- Python 3.8+
+- Python 3 (stdlib only, no extra packages)
 - Claude Code with skill support
 - Session `.jsonl` files exported from [OpenClaw](https://github.com/jarosik9/openclaw)
 
@@ -49,15 +49,13 @@ The skill then asks 2–3 targeted questions based on what it found (loops, high
 
 ## Installation
 
-1. Clone or download this repository.
-2. Copy the skill files into your Claude Code skills directory:
-
 ```bash
-mkdir -p ~/.claude/skills/clawsession-insights
-cp SKILL.md analyze_session.py ~/.claude/skills/clawsession-insights/
+git clone https://github.com/jarosik9/clawsession-insights/ ~/.claude/skills/clawsession-insights
 ```
 
-3. Restart Claude Code (or reload skills if supported).
+> **Note:** The destination path must be exactly `~/.claude/skills/clawsession-insights`. The skill has this path hardcoded — cloning elsewhere or renaming the directory will cause a "Parser not found" error.
+
+Restart Claude Code after cloning.
 
 ---
 
