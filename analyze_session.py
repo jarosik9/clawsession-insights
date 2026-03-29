@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
 OpenClaw session JSONL analyzer.
-Usage: python3 analyze_session.py <path-to-session.jsonl>
+Usage: python3 analyze_session.py <path-to-session.jsonl> [--since HH:MM] [--until HH:MM]
 Outputs: JSON summary to stdout
 """
 import json
 import sys
 import re
 import shlex
+import argparse
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+
+SKILL_DIR = Path(__file__).parent
 
 
 def parse_timestamp(ts_str):
@@ -17,6 +21,59 @@ def parse_timestamp(ts_str):
     if ts_str.endswith('Z'):
         ts_str = ts_str[:-1] + '+00:00'
     return int(datetime.fromisoformat(ts_str).timestamp() * 1000)
+
+
+def load_config():
+    """Load optional config.json from skill directory. Returns (focus_label, focus_patterns)."""
+    config_path = SKILL_DIR / "config.json"
+    if not config_path.exists():
+        return None, []
+    try:
+        cfg = json.loads(config_path.read_text())
+        focus = cfg.get("focus", {})
+        return focus.get("label"), [p for p in focus.get("patterns", []) if p]
+    except Exception:
+        return None, []
+
+
+def _first_real_token(command):
+    """
+    Extract the first meaningful command token from a potentially compound shell command.
+    Handles patterns like: export PATH=... && kubectl ..., VAR=val cmd, sudo cmd, env VAR=val cmd.
+    Splits on && / || / ; and takes the last sub-command's first effective token,
+    since the pattern 'export PATH=... && REAL_CMD' puts the real command after &&.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    # Find positions of shell operators; take tokens after the last one
+    last_op = -1
+    for i, tok in enumerate(tokens):
+        if tok in ('&&', '||', ';'):
+            last_op = i
+    if last_op >= 0:
+        tokens = tokens[last_op + 1:]
+
+    # Skip leading noise: export, env, sudo, VAR=val
+    for tok in tokens:
+        if tok in ('export', 'env', 'sudo'):
+            continue
+        if '=' in tok and not tok.startswith('-'):
+            continue
+        return tok
+    return ""
+
+
+def is_focus_match(command, patterns):
+    """
+    Return True if the command's first effective token matches any pattern.
+    Handles compound commands (export VAR=val && real_cmd).
+    """
+    if not patterns:
+        return True
+    return _first_real_token(command) in set(patterns)
 
 
 def load_events(path):
@@ -69,12 +126,16 @@ def extract_session_meta(events):
         if user != "unknown":
             break
 
+    cwd = session_event.get("cwd", "")
+    # Redact home directory prefix to avoid leaking username in shared reports.
+    cwd = re.sub(r'^(/home/[^/]+|/Users/[^/]+|/root)', '~', cwd)
+
     return {
         "id": session_event.get("id", ""),
         "start_time": session_event["timestamp"],
         "end_time": last_event["timestamp"],
         "duration_ms": end_ms - start_ms,
-        "cwd": session_event.get("cwd", ""),
+        "cwd": cwd,
         "model": model,
         "provider": provider,
         "user": user,
@@ -112,14 +173,17 @@ def extract_conversation(events):
     return sorted(conv, key=lambda x: parse_timestamp(x["timestamp"]))
 
 
-def extract_tool_calls(events):
+def extract_tool_calls(events, focus_patterns):
     """
     Extract all exec tool calls with their results.
     Handles process-chain for long-running commands:
       exec toolCall -> running toolResult -> [process toolCall -> running]* -> completed
-    Returns: (commands, tool_usage, errors)
+    Tags each command with is_focus based on focus_patterns.
+    Tracks other_tool_errors from non-exec toolResults with isError == True.
+    Returns: (commands, tool_usage, errors, other_tool_errors)
     """
     tool_results_by_call_id = {}
+    other_tool_errors = 0
 
     for e in events:
         if e.get("type") != "message":
@@ -128,9 +192,13 @@ def extract_tool_calls(events):
         if msg.get("role") != "toolResult":
             continue
         tool_call_id = msg.get("toolCallId", "")
+        tool_name = msg.get("toolName", "")
         if tool_call_id not in tool_results_by_call_id:
             tool_results_by_call_id[tool_call_id] = []
         tool_results_by_call_id[tool_call_id].append(e)
+        # Count non-exec tool errors via isError flag
+        if tool_name not in ("exec", "process") and msg.get("isError", False):
+            other_tool_errors += 1
 
     exec_calls = []
     tool_usage = {}
@@ -178,7 +246,8 @@ def extract_tool_calls(events):
         details = completed_result.get("message", {}).get("details", {})
         result_ts_ms = parse_timestamp(completed_result["timestamp"])
         exit_code = details.get("exitCode", 0)
-        duration_ms = result_ts_ms - call_ts_ms
+        # Prefer durationMs from OpenClaw's own measurement; fall back to timestamp diff
+        duration_ms = details.get("durationMs") or (result_ts_ms - call_ts_ms)
         status = "ok" if exit_code == 0 else "error"
 
         # Get output text (and error text if non-zero exit)
@@ -192,32 +261,34 @@ def extract_tool_calls(events):
                     error_text = item["text"][:200]
                 break
 
+        cmd_str = call["command"]
         entry = {
             "tool": "exec",
-            "command": call["command"],
+            "command": cmd_str,
             "exit_code": exit_code,
             "duration_ms": duration_ms,
             "status": status,
             "timestamp": call["call_ts"],
             "output_text": output_text,
+            "is_focus": is_focus_match(cmd_str, focus_patterns),
         }
         commands.append(entry)
 
         if exit_code != 0:
             errors.append({
-                "command": call["command"],
+                "command": cmd_str,
                 "exit_code": exit_code,
                 "error_text": error_text,
                 "timestamp": call["call_ts"],
+                "is_focus": entry["is_focus"],
             })
 
-    return commands, tool_usage, errors
+    return commands, tool_usage, errors, other_tool_errors
 
 
 def calculate_timing(events, commands, total_ms):
     """
     LLM time: last toolResult in preceding batch -> assistant message.
-    Preceding batch = all toolResults between previous assistant and current assistant, in document order.
     CLI time: sum of exec command durations.
     User time: preceding assistant -> user message.
     Idle: residual.
@@ -242,7 +313,6 @@ def calculate_timing(events, commands, total_ms):
         elif role == "assistant":
             start = last_tool_result_ts if last_tool_result_ts is not None else last_anchor_ts
             if start is None:
-                # First assistant turn — credit from session start
                 start = parse_timestamp(events[0]["timestamp"]) if events else None
             if start is not None:
                 llm_intervals.append((start, ts))
@@ -299,13 +369,31 @@ def calculate_timing(events, commands, total_ms):
 def normalize_command(cmd):
     """
     Normalize command for loop detection.
-    Strip 'npx'/'npx -y', flags (tokens starting with '-'), quoted string args.
-    Return first two remaining tokens.
+    Strips compound-command prefixes (export VAR=val &&), npx/npx -y,
+    flags starting with '-', and quoted string args.
+    Returns first two remaining meaningful tokens.
     """
     try:
         tokens = shlex.split(cmd)
     except ValueError:
         tokens = cmd.split()
+
+    # Strip compound-command prefix: find last && / || / ; and take tokens after it
+    last_op = -1
+    for i, tok in enumerate(tokens):
+        if tok in ('&&', '||', ';'):
+            last_op = i
+    if last_op >= 0:
+        tokens = tokens[last_op + 1:]
+
+    # Strip leading export / env / sudo / VAR=val
+    while tokens:
+        if tokens[0] in ('export', 'env', 'sudo'):
+            tokens.pop(0)
+        elif '=' in tokens[0] and not tokens[0].startswith('-'):
+            tokens.pop(0)
+        else:
+            break
 
     # Strip 'npx' and optional following '-y'
     if tokens and tokens[0] == "npx":
@@ -320,6 +408,7 @@ def normalize_command(cmd):
 def detect_loops(commands, window=10, threshold=3):
     """
     Detect loops: same normalized command >= threshold times in any window-sized slice.
+    Extends beyond detection window to capture full loop extent.
     Classification uses toolResult output_text:
     - polling_loop: exit_code==0 AND output contains "pending"/"waiting"/"running"/"in progress"
     - error_loop: everything else
@@ -341,7 +430,20 @@ def detect_loops(commands, window=10, threshold=3):
             continue
 
         matching_indices = [j for j, n in enumerate(normalized) if n == normalized[i]]
-        group = [j for j in matching_indices if i <= j < i + window]
+
+        # Extend beyond the initial detection window: keep adding matching commands
+        # as long as the gap to the next occurrence is <= window (in command-index terms).
+        extended = []
+        prev_j = i - 1
+        for j in matching_indices:
+            if j < i:
+                continue
+            if j - prev_j <= window:
+                extended.append(j)
+                prev_j = j
+            else:
+                break
+        group = extended if len(extended) >= threshold else [j for j in matching_indices if i <= j < i + window]
 
         start_cmd = commands[group[0]]
         end_cmd = commands[group[-1]]
@@ -377,8 +479,9 @@ def strip_internal_fields(commands):
     return [{k: v for k, v in c.items() if k != "output_text"} for c in commands]
 
 
-def calculate_stats(events, commands, errors):
-    """Aggregate message counts and token/cost totals."""
+def calculate_stats(events, commands, errors, tool_usage, other_tool_errors,
+                    focus_label, focus_patterns):
+    """Aggregate message counts, token/cost totals, and focus/CLI call breakdown."""
     user_messages = 0
     assistant_messages = 0
     total_tokens = 0
@@ -398,7 +501,17 @@ def calculate_stats(events, commands, errors):
             cost = usage.get("cost", {})
             total_cost += cost.get("total", 0.0)
 
-    return {
+    # Focus / CLI breakdown (only populated when config present)
+    has_config = bool(focus_patterns)
+    focus_calls = sum(1 for c in commands if c.get("is_focus", True))
+    focus_errors = sum(1 for e in errors if e.get("is_focus", True))
+    other_cli_calls = len(commands) - focus_calls
+    other_cli_errors = len(errors) - focus_errors
+    other_tool_calls = sum(
+        v for k, v in tool_usage.items() if k not in ("exec", "process")
+    )
+
+    result = {
         "user_messages": user_messages,
         "assistant_messages": assistant_messages,
         "total_turns": user_messages + assistant_messages,
@@ -408,18 +521,119 @@ def calculate_stats(events, commands, errors):
         "total_cost_usd": round(total_cost, 6),
     }
 
+    if has_config:
+        result.update({
+            "focus_label": focus_label or "CLI",
+            "focus_calls": focus_calls,
+            "focus_errors": focus_errors,
+            "other_cli_calls": other_cli_calls,
+            "other_cli_errors": other_cli_errors,
+            "other_tool_calls": other_tool_calls,
+            "other_tool_errors": other_tool_errors,
+        })
 
-def analyze(path):
+    return result
+
+
+def extract_message_costs(events):
+    """Per-assistant-message cost with timestamp, for per-task cost rollup."""
+    result = []
+    for e in events:
+        if e.get("type") != "message":
+            continue
+        msg = e.get("message", {})
+        if msg.get("role") != "assistant":
+            continue
+        cost = msg.get("usage", {}).get("cost", {}).get("total", 0.0)
+        if cost and cost > 0:
+            result.append({
+                "timestamp": e["timestamp"],
+                "cost_usd": cost,
+            })
+    return result
+
+
+def extract_thinking(events):
+    """Thinking blocks per assistant turn, capped at 1000 chars each."""
+    result = []
+    for e in events:
+        if e.get("type") != "message":
+            continue
+        msg = e.get("message", {})
+        if msg.get("role") != "assistant":
+            continue
+        for item in msg.get("content", []):
+            if isinstance(item, dict) and item.get("type") == "thinking":
+                result.append({
+                    "timestamp": e["timestamp"],
+                    "text": item.get("thinking", "")[:1000],
+                })
+    return result
+
+
+def parse_time_arg(arg, session_start_ms):
+    """
+    Parse --since / --until arg to epoch milliseconds.
+    Accepts HH:MM, HH:MM:SS, or full ISO 8601 timestamp.
+    HH:MM is resolved relative to session start date in UTC.
+    """
+    arg = arg.strip()
+    if "T" in arg:
+        if not arg.endswith("Z") and "+" not in arg:
+            arg += "Z"
+        return parse_timestamp(arg)
+    parts = arg.split(":")
+    h, m = int(parts[0]), int(parts[1])
+    s = int(parts[2]) if len(parts) > 2 else 0
+    session_dt = datetime.fromtimestamp(session_start_ms / 1000, tz=timezone.utc)
+    result_dt = session_dt.replace(hour=h, minute=m, second=s, microsecond=0)
+    return int(result_dt.timestamp() * 1000)
+
+
+def resolve_time_range(since_arg, until_arg, session_start_ms):
+    """Resolve --since / --until args to (since_ts, until_ts) in epoch ms."""
+    since_ts = parse_time_arg(since_arg, session_start_ms) if since_arg else None
+    until_ts = parse_time_arg(until_arg, session_start_ms) if until_arg else None
+    if since_ts and until_ts and until_ts < since_ts:
+        until_ts += 86_400_000  # midnight crossing: add 24h
+    return since_ts, until_ts
+
+
+def apply_time_filter(events, since_ts=None, until_ts=None):
+    """Filter events to those within [since_ts, until_ts]."""
+    return [
+        e for e in events
+        if (since_ts is None or parse_timestamp(e["timestamp"]) >= since_ts)
+        and (until_ts is None or parse_timestamp(e["timestamp"]) <= until_ts)
+    ]
+
+
+def analyze(path, since_arg=None, until_arg=None):
+    focus_label, focus_patterns = load_config()
+
     events = load_events(path)
     if not events:
         print(json.dumps({"error": "Empty session file"}), file=sys.stderr)
         sys.exit(1)
+
+    # Time range filtering
+    if since_arg or until_arg:
+        session_start_ms = parse_timestamp(events[0]["timestamp"])
+        since_ts, until_ts = resolve_time_range(since_arg, until_arg, session_start_ms)
+        events = apply_time_filter(events, since_ts, until_ts)
+        if not events:
+            print(f"Error: no events found in specified time range", file=sys.stderr)
+            sys.exit(1)
+
     session = extract_session_meta(events)
-    commands, tool_usage, errors = extract_tool_calls(events)
+    commands, tool_usage, errors, other_tool_errors = extract_tool_calls(events, focus_patterns)
     timing = calculate_timing(events, commands, session["duration_ms"])
     loops = detect_loops(commands)
     conversation = extract_conversation(events)
-    stats = calculate_stats(events, commands, errors)
+    stats = calculate_stats(events, commands, errors, tool_usage, other_tool_errors,
+                            focus_label, focus_patterns)
+    message_costs = extract_message_costs(events)
+    thinking = extract_thinking(events)
 
     output = {
         "session": session,
@@ -430,12 +644,18 @@ def analyze(path):
         "commands": strip_internal_fields(commands),
         "tool_usage": tool_usage,
         "conversation": conversation,
+        "message_costs": message_costs,
+        "thinking": thinking,
     }
     print(json.dumps(output, indent=2))
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Usage: analyze_session.py <path-to-session.jsonl>", file=sys.stderr)
-        sys.exit(1)
-    analyze(sys.argv[1])
+    parser = argparse.ArgumentParser(
+        description="Analyze an OpenClaw session JSONL file."
+    )
+    parser.add_argument("path", help="Path to session.jsonl")
+    parser.add_argument("--since", help="Start time filter: HH:MM or ISO timestamp")
+    parser.add_argument("--until", help="End time filter: HH:MM or ISO timestamp")
+    args = parser.parse_args()
+    analyze(args.path, since_arg=args.since, until_arg=args.until)
