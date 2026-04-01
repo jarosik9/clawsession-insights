@@ -401,7 +401,18 @@ def normalize_command(cmd):
         if tokens and tokens[0] == "-y":
             tokens.pop(0)
 
-    filtered = [t for t in tokens if not t.startswith("-")]
+    # Filter flags and their values: skip flag tokens (start with '-') AND
+    # the immediately following value token (e.g. '--format json' → skip both)
+    filtered = []
+    skip_next = False
+    for t in tokens:
+        if skip_next:
+            skip_next = False
+            continue
+        if t.startswith("-"):
+            skip_next = True  # next token is the flag's value, skip it too
+            continue
+        filtered.append(t)
     return " ".join(filtered[:2]) if len(filtered) >= 2 else " ".join(filtered)
 
 
@@ -409,8 +420,10 @@ def detect_loops(commands, window=10, threshold=3):
     """
     Detect loops: same normalized command >= threshold times in any window-sized slice.
     Extends beyond detection window to capture full loop extent.
-    Classification uses toolResult output_text:
-    - polling_loop: exit_code==0 AND output contains "pending"/"waiting"/"running"/"in progress"
+    Classification (in priority order):
+    - polling_loop: exit_code==0 AND output contains polling keywords
+    - polling_loop: all exit_code==0 (fallback — repeated success can't be an error loop)
+    - exploration_loop: exit_code not all 1 AND commands target diverse resources (≥60% unique 3rd tokens)
     - error_loop: everything else
     """
     if not commands:
@@ -451,11 +464,28 @@ def detect_loops(commands, window=10, threshold=3):
         loop_type = "error_loop"
         all_zero_exit = all(commands[j]["exit_code"] == 0 for j in group)
         if all_zero_exit:
+            # Priority 1: output contains polling keywords
             for cmd_idx in group:
                 output_text = commands[cmd_idx].get("output_text", "").lower()
                 if any(kw in output_text for kw in polling_keywords):
                     loop_type = "polling_loop"
                     break
+            else:
+                # Priority 2: fallback — all success means it can't be an error loop
+                loop_type = "polling_loop"
+        else:
+            # Priority 3: exploration_loop — not all failures, and commands target diverse resources
+            not_all_fail = not all(commands[j]["exit_code"] != 0 for j in group)
+            if not_all_fail:
+                third_tokens = []
+                for j in group:
+                    parts = normalize_command(commands[j]["command"]).split()
+                    if len(parts) >= 3:
+                        third_tokens.append(parts[2])
+                if third_tokens:
+                    diversity = len(set(third_tokens)) / len(third_tokens)
+                    if diversity >= 0.6:
+                        loop_type = "exploration_loop"
 
         loops.append({
             "command_normalized": normalized[i],
@@ -608,6 +638,395 @@ def apply_time_filter(events, since_ts=None, until_ts=None):
     ]
 
 
+# ---------------------------------------------------------------------------
+# Claude Code CLI JSONL format support
+# ---------------------------------------------------------------------------
+
+def detect_format(events):
+    """Detect JSONL format: 'openclaw' or 'claude-code'."""
+    for e in events[:10]:
+        if e.get("type") == "session":
+            return "openclaw"
+        if e.get("entrypoint") in ("claude-desktop", "claude-code"):
+            return "claude-code"
+        # Claude Code without entrypoint: has 'version' and type user/assistant
+        if e.get("type") in ("user", "assistant") and e.get("version"):
+            return "claude-code"
+    return "openclaw"
+
+
+def extract_session_meta_cc(events):
+    """Extract session metadata from Claude Code CLI JSONL."""
+    first_ts = events[0]["timestamp"]
+    last_ts = events[-1]["timestamp"]
+    start_ms = parse_timestamp(first_ts)
+    end_ms = parse_timestamp(last_ts)
+
+    model = "unknown"
+    provider = "anthropic"
+    for e in events:
+        if e.get("type") == "assistant":
+            m = e.get("message", {}).get("model", "")
+            if m:
+                model = m
+                break
+
+    # CWD from any event
+    cwd = ""
+    for e in events:
+        if e.get("cwd"):
+            cwd = e["cwd"]
+            break
+    cwd = re.sub(r'^(/home/[^/]+|/Users/[^/]+|/root)', '~', cwd)
+
+    # Session ID from any event
+    session_id = ""
+    for e in events:
+        if e.get("sessionId"):
+            session_id = e["sessionId"]
+            break
+
+    # User: derive from cwd (~/<username>/...) or unknown
+    user = "unknown"
+    m = re.search(r'/Users/([^/]+)/', cwd + "/")
+    if m:
+        user = m.group(1)
+
+    return {
+        "id": session_id,
+        "start_time": first_ts,
+        "end_time": last_ts,
+        "duration_ms": end_ms - start_ms,
+        "cwd": cwd,
+        "model": model,
+        "provider": provider,
+        "user": user,
+    }
+
+
+def extract_tool_calls_cc(events, focus_patterns):
+    """Extract Bash tool calls from Claude Code CLI JSONL format."""
+    # Build tool_use_id → result map from user messages
+    results = {}
+    for e in events:
+        if e.get("type") != "user":
+            continue
+        for c in e.get("message", {}).get("content", []):
+            if not isinstance(c, dict) or c.get("type") != "tool_result":
+                continue
+            tid = c.get("tool_use_id")
+            if not tid:
+                continue
+            is_error = c.get("isError")
+            content = c.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    x.get("text", "") for x in content if isinstance(x, dict)
+                )
+            content_str = str(content)
+            # Claude Code embeds exit code in content: "Exit code N\n<output>"
+            # isError is typically None even for failures in this format
+            exit_code = 1 if is_error else 0
+            m = re.match(r'^Exit code (\d+)\n', content_str)
+            if m:
+                exit_code = int(m.group(1))
+                content_str = content_str[m.end():]  # strip "Exit code N\n" prefix
+            results[tid] = {
+                "exit_code": exit_code,
+                "output_text": content_str[:500],
+                "timestamp": e.get("timestamp"),
+            }
+
+    commands = []
+    tool_usage = {}
+    errors_list = []
+    other_tool_errors = 0
+
+    for e in events:
+        if e.get("type") != "assistant":
+            continue
+        for c in e.get("message", {}).get("content", []):
+            if not isinstance(c, dict) or c.get("type") != "tool_use":
+                continue
+            tool_name = c.get("name", "")
+            tool_usage[tool_name] = tool_usage.get(tool_name, 0) + 1
+
+            if tool_name != "Bash":
+                # Non-Bash tool errors
+                tid = c.get("id")
+                res = results.get(tid, {})
+                if res.get("exit_code", 0) != 0:
+                    other_tool_errors += 1
+                continue
+
+            tid = c.get("id")
+            res = results.get(tid, {})
+            cmd = c.get("input", {}).get("command", "")
+            exit_code = res.get("exit_code", 0)
+            # Duration from tool_use timestamp to tool_result timestamp
+            start_ts = e.get("timestamp", "")
+            end_ts = res.get("timestamp", start_ts)
+            duration_ms = 0
+            if start_ts and end_ts:
+                try:
+                    duration_ms = max(0, parse_timestamp(end_ts) - parse_timestamp(start_ts))
+                except Exception:
+                    duration_ms = 0
+
+            is_focus = is_focus_match(cmd, focus_patterns)
+            entry = {
+                "tool": "exec",
+                "command": cmd,
+                "exit_code": exit_code,
+                "duration_ms": duration_ms,
+                "status": "error" if exit_code != 0 else "ok",
+                "timestamp": start_ts,
+                "output_text": res.get("output_text", ""),
+                "is_focus": is_focus,
+            }
+            commands.append(entry)
+            if exit_code != 0:
+                errors_list.append({
+                    "command": cmd,
+                    "exit_code": exit_code,
+                    "error_text": res.get("output_text", "")[:300],
+                    "timestamp": start_ts,
+                    "is_focus": is_focus,
+                })
+
+    # Map 'exec' key for tool_usage
+    bash_count = tool_usage.pop("Bash", 0)
+    if bash_count:
+        tool_usage["exec"] = bash_count
+
+    return commands, tool_usage, errors_list, other_tool_errors
+
+
+def extract_conversation_cc(events):
+    """Extract conversation turns from Claude Code CLI JSONL.
+
+    User messages come from queue-operation 'enqueue' events (actual human input).
+    Assistant messages come from type='assistant' events with text content.
+    """
+    conv = []
+    seen_ts = set()
+
+    # User turns: queue-operation enqueue events contain the real human text
+    for e in events:
+        if e.get("type") != "queue-operation" or e.get("operation") != "enqueue":
+            continue
+        text = e.get("content", "").strip()
+        if not text:
+            continue
+        # Skip system startup injection messages
+        if (text.startswith("A new session was started") or
+                text.startswith("Execute your Session") or
+                text.startswith("Base directory for this skill")):
+            continue
+        ts = e.get("timestamp", "")
+        if ts in seen_ts:
+            continue
+        seen_ts.add(ts)
+        conv.append({"role": "user", "text": text, "timestamp": ts})
+
+    # Assistant turns: type='assistant' with text content
+    for e in events:
+        if e.get("type") != "assistant":
+            continue
+        msg = e.get("message", {})
+        if msg.get("role") != "assistant":
+            continue
+        parts = []
+        for item in msg.get("content", []):
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", "").strip())
+        text = " ".join(parts).strip()
+        if not text:
+            continue
+        ts = e.get("timestamp", "")
+        conv.append({"role": "assistant", "text": text, "timestamp": ts})
+
+    return sorted(conv, key=lambda x: parse_timestamp(x["timestamp"]))
+
+
+def extract_message_costs_cc(events):
+    """Extract per-message costs from Claude Code CLI JSONL."""
+    result = []
+    for e in events:
+        if e.get("type") != "assistant":
+            continue
+        msg = e.get("message", {})
+        usage = msg.get("usage", {})
+        # Claude Code uses different field names
+        cost = 0.0
+        cost_data = usage.get("cost", {})
+        if isinstance(cost_data, dict):
+            cost = cost_data.get("total", 0.0)
+        if cost and cost > 0:
+            result.append({"timestamp": e["timestamp"], "cost_usd": cost})
+    return result
+
+
+def extract_thinking_cc(events):
+    """Extract thinking blocks from Claude Code CLI JSONL."""
+    result = []
+    for e in events:
+        if e.get("type") != "assistant":
+            continue
+        for c in e.get("message", {}).get("content", []):
+            if isinstance(c, dict) and c.get("type") == "thinking":
+                result.append({
+                    "timestamp": e["timestamp"],
+                    "text": c.get("thinking", "")[:1000],
+                })
+    return result
+
+
+def calculate_stats_cc(events, commands, errors, tool_usage, other_tool_errors,
+                       focus_label, focus_patterns):
+    """Calculate stats from Claude Code CLI JSONL."""
+    # User messages: count queue-operation enqueue events (actual human inputs)
+    user_messages = sum(
+        1 for e in events
+        if e.get("type") == "queue-operation" and e.get("operation") == "enqueue"
+        and e.get("content", "").strip()
+        and not e.get("content", "").startswith("A new session was started")
+        and not e.get("content", "").startswith("Execute your Session")
+    )
+    # Only count assistant turns that actually produced text visible to the user.
+    # Claude Code emits many assistant events (thinking, tool_use chunks) per logical turn.
+    assistant_messages = sum(
+        1 for e in events
+        if e.get("type") == "assistant"
+        and any(
+            isinstance(c, dict) and c.get("type") == "text" and c.get("text", "").strip()
+            for c in e.get("message", {}).get("content", [])
+        )
+    )
+    total_tokens = 0
+    total_cost = 0.0
+    for e in events:
+        if e.get("type") == "assistant":
+            usage = e.get("message", {}).get("usage", {})
+            # Claude Code uses outputTokens / inputTokens / cacheReadInputTokens etc.
+            total_tokens += (usage.get("output_tokens", 0) +
+                             usage.get("input_tokens", 0) +
+                             usage.get("cache_read_input_tokens", 0))
+            cost_data = usage.get("cost", {})
+            if isinstance(cost_data, dict):
+                total_cost += cost_data.get("total", 0.0)
+
+    has_config = bool(focus_patterns)
+    focus_calls = sum(1 for c in commands if c.get("is_focus", True))
+    focus_errors = sum(1 for err in errors if err.get("is_focus", True))
+    other_cli_calls = len(commands) - focus_calls
+    other_cli_errors = len(errors) - focus_errors
+    other_tool_calls = sum(v for k, v in tool_usage.items() if k not in ("exec",))
+
+    result = {
+        "user_messages": user_messages,
+        "assistant_messages": assistant_messages,
+        "total_turns": user_messages + assistant_messages,
+        "tool_calls": len(commands),
+        "tool_errors": len(errors),
+        "total_tokens": total_tokens,
+        "total_cost_usd": round(total_cost, 6),
+    }
+    if has_config:
+        result.update({
+            "focus_label": focus_label or "CLI",
+            "focus_calls": focus_calls,
+            "focus_errors": focus_errors,
+            "other_cli_calls": other_cli_calls,
+            "other_cli_errors": other_cli_errors,
+            "other_tool_calls": other_tool_calls,
+            "other_tool_errors": other_tool_errors,
+        })
+    return result
+
+
+def calculate_timing_cc(events, commands, total_ms):
+    """
+    Approximate timing for Claude Code CLI format.
+    - LLM time: gap between queue-operation enqueue and first subsequent assistant text turn
+    - CLI time: sum of bash command duration_ms (same as OpenClaw)
+    - User time: gap between last assistant text and next queue-operation enqueue
+    - Idle: residual
+    """
+    # Build sorted list of key timestamps
+    enqueue_ts = sorted(
+        parse_timestamp(e["timestamp"])
+        for e in events
+        if e.get("type") == "queue-operation" and e.get("operation") == "enqueue"
+    )
+
+    # First assistant text after each enqueue = end of LLM inference
+    # We approximate by finding the first assistant event with text content after each enqueue
+    asst_text_ts = []
+    for e in events:
+        if e.get("type") != "assistant":
+            continue
+        for c in e.get("message", {}).get("content", []):
+            if isinstance(c, dict) and c.get("type") == "text" and c.get("text", "").strip():
+                asst_text_ts.append(parse_timestamp(e["timestamp"]))
+                break
+
+    asst_text_ts = sorted(asst_text_ts)
+
+    llm_intervals = []
+    user_intervals = []
+
+    for i, enq_ts in enumerate(enqueue_ts):
+        # LLM time: enqueue → first assistant text after it
+        next_asst = next((t for t in asst_text_ts if t > enq_ts), None)
+        if next_asst:
+            llm_intervals.append((enq_ts, next_asst))
+
+        # User time: last assistant text before this enqueue → this enqueue
+        prev_asst = next((t for t in reversed(asst_text_ts) if t < enq_ts), None)
+        # But only count if there's no CLI activity in between (approximation)
+        if prev_asst and i > 0:  # skip first message (no user wait)
+            user_intervals.append((prev_asst, enq_ts))
+
+    def total_from(intervals):
+        return sum(max(0, e - s) for s, e in intervals)
+
+    def avg_from(intervals):
+        vals = [max(0, e - s) for s, e in intervals]
+        return int(sum(vals) / len(vals)) if vals else 0
+
+    def max_from(intervals):
+        vals = [max(0, e - s) for s, e in intervals]
+        return max(vals) if vals else 0
+
+    cli_durations = [c["duration_ms"] for c in commands]
+    cli_ms = sum(cli_durations)
+    llm_ms = total_from(llm_intervals)
+    user_ms = total_from(user_intervals)
+    idle_ms = max(0, total_ms - llm_ms - cli_ms - user_ms)
+
+    def pct(val):
+        return round(val * 100 / total_ms) if total_ms > 0 else 0
+
+    return {
+        "total_ms": total_ms,
+        "llm_ms": llm_ms,
+        "llm_pct": pct(llm_ms),
+        "llm_avg_ms": avg_from(llm_intervals),
+        "llm_max_ms": max_from(llm_intervals),
+        "cli_ms": cli_ms,
+        "cli_pct": pct(cli_ms),
+        "cli_avg_ms": int(sum(cli_durations) / len(cli_durations)) if cli_durations else 0,
+        "cli_max_ms": max(cli_durations) if cli_durations else 0,
+        "user_ms": user_ms,
+        "user_pct": pct(user_ms),
+        "idle_ms": idle_ms,
+        "idle_pct": pct(idle_ms),
+    }
+
+
+# ---------------------------------------------------------------------------
+
 def analyze(path, since_arg=None, until_arg=None):
     focus_label, focus_patterns = load_config()
 
@@ -615,6 +1034,8 @@ def analyze(path, since_arg=None, until_arg=None):
     if not events:
         print(json.dumps({"error": "Empty session file"}), file=sys.stderr)
         sys.exit(1)
+
+    fmt = detect_format(events)
 
     # Time range filtering
     if since_arg or until_arg:
@@ -625,15 +1046,27 @@ def analyze(path, since_arg=None, until_arg=None):
             print(f"Error: no events found in specified time range", file=sys.stderr)
             sys.exit(1)
 
-    session = extract_session_meta(events)
-    commands, tool_usage, errors, other_tool_errors = extract_tool_calls(events, focus_patterns)
-    timing = calculate_timing(events, commands, session["duration_ms"])
+    if fmt == "claude-code":
+        session = extract_session_meta_cc(events)
+        commands, tool_usage, errors, other_tool_errors = extract_tool_calls_cc(events, focus_patterns)
+        conversation = extract_conversation_cc(events)
+        message_costs = extract_message_costs_cc(events)
+        thinking = extract_thinking_cc(events)
+        stats = calculate_stats_cc(events, commands, errors, tool_usage, other_tool_errors,
+                                   focus_label, focus_patterns)
+        timing = calculate_timing_cc(events, commands, session["duration_ms"])
+    else:
+        session = extract_session_meta(events)
+        commands, tool_usage, errors, other_tool_errors = extract_tool_calls(events, focus_patterns)
+        conversation = extract_conversation(events)
+        message_costs = extract_message_costs(events)
+        thinking = extract_thinking(events)
+        stats = calculate_stats(events, commands, errors, tool_usage, other_tool_errors,
+                                focus_label, focus_patterns)
+
+    if fmt != "claude-code":
+        timing = calculate_timing(events, commands, session["duration_ms"])
     loops = detect_loops(commands)
-    conversation = extract_conversation(events)
-    stats = calculate_stats(events, commands, errors, tool_usage, other_tool_errors,
-                            focus_label, focus_patterns)
-    message_costs = extract_message_costs(events)
-    thinking = extract_thinking(events)
 
     output = {
         "session": session,

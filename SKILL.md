@@ -1,6 +1,6 @@
 ---
 name: analyze-session
-description: Analyze an OpenClaw session JSONL file — segments tasks, scores agent quality, surfaces loops/errors/timing, asks targeted questions, and writes a Markdown report.
+description: Analyze an OpenClaw or Claude Code CLI session JSONL file — segments tasks, scores agent quality, surfaces loops/errors/timing, asks targeted questions, and writes a Markdown report. Supports both OpenClaw format (type:session/message/toolResult) and Claude Code CLI format (type:user/assistant/queue-operation).
 ---
 
 # Session Analyzer
@@ -51,7 +51,7 @@ tokens as `N/A (not reported by provider)` wherever tokens appear.
 `cost_usd == 0`. When `cost_unavailable = true`:
 - `cost_usd` for all tasks = `null` (display as `—`)
 - Skip `cost_per_min` and `high_burn` (treat as unknown)
-- `cost_per_task` in header and stats block = `—`
+- `cost_per_min` in header and stats block = `—`
 - Add note in Performance section: `Cost: N/A (not reported by provider)`
 
 **cost_usd** — if not `cost_unavailable`: sum `cost_usd` from `message_costs[]` within
@@ -67,29 +67,50 @@ Skip entirely when `cost_unavailable`.
 Of remaining "meaningful" commands: `round(exit_0_count / total * 100)`.
 If no meaningful commands: `null` (display as `—`).
 
-**quality_score** — computed once across all tasks:
+**quality_score** — computed as the average of four dimensions (each 0–100):
+
+**dim_execution** — session-wide command success rate:
 ```
-score = 100
+meaningful = commands[] excluding (ls, cat, head, tail, echo, pwd, which, grep, find, rg)
+dim_execution = round(exit_0_count / len(meaningful) × 100) if meaningful else 100
+```
 
-Error loops (not polling_loop) — severity by loop count:
-  count ≤ 5: -8  |  count 6–30: -15  |  count > 30: -25
-  Total capped at -40
+**dim_completion** — task completion rate:
+```
+dim_completion = round(completed_tasks / total_tasks × 100) if tasks else 100
+```
 
-Context loss confirmed by Phase 4 thinking: -10 each, capped at -30
+**dim_depth** — maximum task complexity detected in commands[] text (take highest match):
+```
+"util abi encode" OR "bridge" OR "layerzero" OR "cross-chain"  → 100
+"tx call" OR "contract"                                         → 80
+"pact submit"                                                   → 60
+"tx transfer"                                                   → 40
+"faucet" OR "onboard"                                          → 20
+(none of the above)                                            → 10
+```
 
-Efficiency signal (weighted mean across tasks with non-null efficiency_pct):
-  < 50%: -20  |  50–69%: -10  |  70–84%: -5  |  ≥ 85%: 0
+**dim_ux** — user experience smoothness:
+```
+dim_ux = 100
+- confirmed context_loss (Phase 4 thinking confirmed): -10 each, capped at -30
+- abandoned tasks: -8 each, capped at -20
+- error_loop with count > 10: -15 each, capped at -30   (large unexplained loops)
+- error_loop with 3 ≤ count ≤ 10: -5 each, capped at -20
+Note: polling_loop and exploration_loop do NOT affect dim_ux.
+dim_ux = max(dim_ux, 0)
+```
 
-Abandoned tasks (status == "abandoned"): -8 each, capped at -20
-
-High burn tasks (skip when cost_unavailable): -5 each, capped at -10
-
-score = max(score, 0)
+```
+quality_score = round((dim_execution + dim_completion + dim_depth + dim_ux) / 4)
 ```
 Grade: 90–100 = A, 75–89 = B, 60–74 = C, 45–59 = D, <45 = F.
 
-If no tasks detected, replace efficiency signal with: `-15 if tool_errors/tool_calls > 0.5`,
-`-8 if > 0.3`. Note: "score based on session-level signals — no tasks detected."
+If no tasks detected: `dim_completion = 100`. Replace `dim_depth` with:
+```
+dim_depth = 10 + (15 if tool_errors/tool_calls < 0.3 else 0)
+```
+Note in report: "score based on session-level signals — no tasks detected."
 
 ---
 
@@ -148,8 +169,14 @@ Then compute `quality_score` and `quality_grade`.
 ### Phase 4 — Targeted thinking analysis (conditional)
 
 Skip entirely if either condition is false:
-1. At least one of: `loops` non-empty, any task `status == "abandoned"`, any task `context_loss` non-empty
-2. `thinking[]` is non-empty
+1. `thinking[]` is non-empty
+2. At least one of:
+   - any `error_loop` with `count > 10`
+   - any task `status == "abandoned"`
+   - any task `context_loss` non-empty
+
+Do NOT trigger for: `polling_loop`, `exploration_loop`, or `error_loop` with `count ≤ 10`
+(root cause is usually evident from error_text alone).
 
 **Cap: max 3 LLM calls.** Priority when >3 triggers: abandoned tasks first, then loops, then context loss.
 
@@ -201,7 +228,12 @@ User:    <session.user>
 CWD:     <session.cwd>
 Duration: <session.duration_ms as Xm Ys>
 
-Quality: <quality_score>/100 (<quality_grade>)  ·  <N completed>/<N total> tasks  ·  <$X.XXX or "—" if cost_unavailable>/task
+Quality: <quality_score>/100 (<quality_grade>)  ·  <N completed>/<N total> tasks  ·  <$X.XX/min or "—" if cost_unavailable>/min
+  Execution  <bar>  <dim_execution>
+  Completion <bar>  <dim_completion>
+  Depth      <bar>  <dim_depth>  (<label: e.g. "cross-chain" or "transfer only">)
+  UX         <bar>  <dim_ux>
+(bar = "█"×round(score/10) + "░"×(10−round(score/10)))
 
 Stats
   Turns: <stats.total_turns>  Tool calls: <stats.tool_calls>  Errors: <stats.tool_errors>
@@ -228,7 +260,7 @@ Then ask questions **one at a time**, waiting for each answer. Pick top 2–5 fr
 priority pool (never exceed 5):
 
 1. Abandoned task: "Task N ('[title]') appears abandoned. What happened?"
-2. Loop: "The agent repeated `<cmd>` × N times. Was this expected or a bug?"
+2. Error loop (error_loop only, NOT polling_loop or exploration_loop): "The agent repeated `<cmd>` × N times. Was this expected or a bug?"
 3. Low efficiency (<50%): "Task N had a X% command success rate. Was the agent struggling?"
 4. High burn: "Task N cost $X in Nm — above session average. Was this expected?"
 5. Context loss: "Task N shows context loss: [description]. Did you notice the agent losing track?"
@@ -261,7 +293,13 @@ If `--since` or `--until` was passed, include the range in the filename:
 ```markdown
 # Session Analysis: <session.id>
 
-**Quality: <score>/100 (<grade>)**  ·  <N>/<N> tasks  ·  <$X.XXX or "—" if cost_unavailable>/task
+**Quality: <score>/100 (<grade>)**  ·  <N>/<N> tasks  ·  <$X.XX/min or "—" if cost_unavailable>/min
+```
+  Execution  <bar>  <dim_execution>
+  Completion <bar>  <dim_completion>
+  Depth      <bar>  <dim_depth>  (<depth label>)
+  UX         <bar>  <dim_ux>
+```
 **Date:** <date> | **Model:** <model> | **Duration:** <Xm Ys>
 **User:** <user> | **CWD:** <cwd>
 [> *Generated in silent mode — no user input collected.*]
@@ -330,6 +368,17 @@ Duration for each row must be taken from `duration_ms` in `commands[]`, formatte
 | Idle / other  | <idle_ms as Xm Ys> | <pct>% | — | — |
 
 **Tokens:** <total_tokens> | **Cost:** <$X.XX | "N/A (not reported by provider)" if cost_unavailable>
+
+## Systemic Issues
+<only include if any error matches a known pattern below; omit section entirely if none>
+Flag these patterns from `errors[]`:
+- `error_text` contains "deprecated"                  → ⚠️ API deprecation (known CLI flag change)
+- `error_text` contains "CORE_API_12007"              → ⚠️ Missing --src-addr (recurring pattern)
+- `error_text` contains "cannot be combined"          → ⚠️ CLI flag conflict (--spec-json + --permissions)
+- `error_text` contains "403" AND "policy"            → ⚠️ Agent permission boundary (policy management requires owner)
+- `error_text` contains "pacts:write"                 → ⚠️ Missing pacts:write scope (Option B onboarding API key may not include this scope — known bug)
+
+For each match, output one line: `- **[pattern name]:** <command truncated to 60 chars> — <brief explanation>`
 ```
 
 **LLM call for narrative sections** — make one call to generate Summary and UX Friction Points:
@@ -360,14 +409,14 @@ Add > *Thinking: root_cause* blockquote if available.
 Incorporate user answers where relevant.
 Write "None detected." if nothing to report.
 Do not invent friction points — only report what the data shows.
-Signals to cover in order: context_loss, low efficiency (<50%), error_loops, high_burn.
+Signals to cover in order: context_loss, low efficiency (<50%), error_loops (NOT polling_loop or exploration_loop), high_burn.
 Skip signals the user confirmed were expected.
 ```
 
 After writing the report, print:
 ```
 ✓ Report written to <output_path>
-  Quality: <score>/100 (<grade>)  ·  <N>/<N> tasks  ·  $<X.XXX>/task
-  Key issue: <most prominent loop or error, or "None detected">
+  Quality: <score>/100 (<grade>)  ·  <N>/<N> tasks  ·  $<X.XX>/min
+  Key issue: <most prominent error_loop or error, or "None detected">
   Duration breakdown: LLM <pct>% / CLI <pct>% / User <pct>% / Idle <pct>%
 ```
