@@ -1,0 +1,6 @@
+{
+  "focus": {
+    "label": "Wallet CLI",
+    "patterns": ["caw", "npx", "git", "clawhub"]
+  }
+}

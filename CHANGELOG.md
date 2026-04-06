@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.5.0 — 2026-04-06
+
+### Feature: Multi-format session support (OpenClaw + Claude Code CLI + Langfuse trace)
+
+**Formats supported:**
+- OpenClaw JSONL sessions (original format)
+- Claude Code CLI JSONL sessions (native CLI logs)
+- Langfuse trace JSON arrays (from Langfuse platform)
+
+**Parser changes:**
+- Added `detect_format()`: distinguish JSONL vs JSON array
+- Added `detect_jsonl_subformat()`: distinguish OpenClaw vs Claude Code CLI (with two-pass signal detection)
+- Added `convert_trace_to_events()`: convert Langfuse trace SPAN/GENERATION events to unified internal format
+- Added `extract_tool_calls_trace()`: extract tool invocations from trace-converted events
+- Added `extract_tool_calls_claude_code()`: extract tool calls from Claude Code CLI message.content format
+- Modified `extract_tool_calls()`: route to appropriate handler based on format detection
+- Modified `load_events()`: handle both JSONL and JSON array inputs
+- Fixed `detect_jsonl_subformat()`: prioritize CLI signals (tool_use/tool_result) in first pass to handle traces correctly
+- Added `env_bootstrap` to tool recognition list and `normalize_tool_name()` mapping
+
+**Quality improvements:**
+- Fixed 7 bare `except:` clauses → specific exception types
+- Optimized format detection: O(2n) → O(n) with early exit
+- M3 verification: confirmed zero mutations, idempotent operations
+
+**Test coverage:**
+- T1 (OpenClaw): 46 tool_calls ✅ (zero regression)
+- T3 (Claude Code CLI): 99 tool_calls ✅ (unchanged)
+- T4 (Langfuse trace): 134 tool_calls ✅ (newly verified)
+
+---
+
 ## v0.2 — planned
 
 ### Feature: Focus configuration

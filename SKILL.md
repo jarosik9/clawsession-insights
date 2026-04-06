@@ -1,223 +1,227 @@
 ---
 name: analyze-session
-description: Analyze an OpenClaw or Claude Code CLI session JSONL file — segments tasks, scores agent quality, surfaces loops/errors/timing, asks targeted questions, and writes a Markdown report. Supports both OpenClaw format (type:session/message/toolResult) and Claude Code CLI format (type:user/assistant/queue-operation).
+description: "Analyze OpenClaw, Claude Code CLI, or Langfuse trace session logs. MUST use when: user says 'analyze session', 'review my session', 'session report', 'what happened in this session', 'session quality', or provides a session file (.jsonl or .json). Segments tasks, scores agent quality (0-100), surfaces loops/errors/friction, asks targeted questions, writes a Markdown report. Supports three formats: OpenClaw JSONL, Claude Code CLI JSONL, and Langfuse trace JSON."
 ---
 
 # Session Analyzer
 
-Analyze an OpenClaw session log and produce a structured Markdown report.
+**Turns a raw session log into an actionable quality report — so you know what the agent did well, where it got stuck, and what to fix.**
 
-## Usage
+## Who This Is For
+
+You are helping an AI agent developer or product manager understand what happened in a session. They want to know: did the agent complete the tasks? Where did it struggle? Was the session cost-effective?
+
+## When to Use / When NOT to Use
+
+✅ Use when:
+- User provides a session file: `.jsonl` (OpenClaw or Claude Code CLI) or `.json` (Langfuse trace)
+- User asks to "analyze", "review", or "report on" a session
+- User asks about session quality, cost, or agent performance
+- User wants to understand tool execution patterns, timing, or errors
+
+❌ Do NOT use for:
+- Live session monitoring (this is post-hoc analysis)
+- Comparing two sessions side-by-side (use openclaw-eval-skill for A/B)
+- Files not in supported formats (OpenClaw JSONL, Claude Code CLI JSONL, Langfuse JSON trace)
+
+## Prerequisites
+
+- Python 3.10+ available on PATH
+- Parser: `~/.claude/skills/clawsession-insights/analyze_session.py`
+- No external Python dependencies required (stdlib only)
+
+---
+
+## 🚨 Critical Rules
+
+1. **Execute phases in order: 1 → 2 → 3 → 4 → 5 → 6 → 7. Do not skip or reorder.**
+2. **Phase 4 is conditional** — only run it when triggered (see conditions below).
+3. **Ask questions one at a time** in Phase 5 — wait for each answer before the next.
+4. **Never invent friction points** — only report what the data shows.
+
+---
+
+## Quick Reference
 
 ```
 /analyze-session <path-to-session.jsonl> [--since HH:MM] [--until HH:MM] [--silent]
 ```
 
-## Instructions
-
-Follow these phases exactly in order. Do not skip phases. Do not reorder.
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `<path>` | ✅ | Absolute or relative path to `.jsonl` session file |
+| `--since HH:MM` | ❌ | Only analyze events after this time |
+| `--until HH:MM` | ❌ | Only analyze events before this time |
+| `--silent` | ❌ | Skip questions (Phase 5-6), go straight to report |
 
 ---
 
-### Phase 1 — Run the parser
+## Phase 1 — Run the parser
+
+Run the Python parser to extract structured data from the JSONL:
 
 ```bash
 python3 ~/.claude/skills/clawsession-insights/analyze_session.py <input_path> [--since <arg>] [--until <arg>]
 ```
 
-If the file does not exist, tell the user:
+⚠️ **If the parser file doesn't exist**, tell the user:
 > "Parser not found. Please install the skill first: https://github.com/jarosik9/openclaw-session-analysis"
-and stop.
 
-Capture the full JSON output. If the parser exits with a non-zero code, show the error and stop.
+⚠️ **If the parser exits non-zero**, show the error and stop.
 
-The JSON contains: `session`, `stats`, `timing`, `loops`, `errors`, `commands[]`,
-`tool_usage`, `conversation[]`, `message_costs[]`, `thinking[]`.
+⚠️ **If the JSONL is not a valid session format** (neither OpenClaw nor Claude Code CLI), the parser will error. Tell the user: "This file doesn't look like an OpenClaw or Claude Code session log."
+
+Capture the full JSON output. It contains: `session`, `stats`, `timing`, `loops`, `errors`, `commands[]`, `tool_usage`, `conversation[]`, `message_costs[]`, `thinking[]`.
 
 ---
 
-### Phase 2 — Math pre-processing
+## Phase 2 — Segment the conversation into tasks
 
-Compute per-task signals from `commands[]` and `message_costs[]`. This phase runs
-**after Phase 3** returns task time ranges, but is described here because it feeds
-Phase 5 and Phase 7.
+You make one LLM call to identify what the user was working on.
 
-For each task returned by Phase 3, filter by `start_time ≤ timestamp ≤ end_time`:
+**Read the full prompt template from:** `references/prompts.md` → "Task Segmentation Prompt"
 
-**tokens_unavailable** — set `true` if `stats.total_tokens == 0`. When true, display
-tokens as `N/A (not reported by provider)` wherever tokens appear.
+**Transcript formatting rules** are also in `references/prompts.md` → "Transcript Formatting Rules"
 
-**cost_unavailable** — set `true` if `message_costs[]` is empty OR all entries have
-`cost_usd == 0`. When `cost_unavailable = true`:
-- `cost_usd` for all tasks = `null` (display as `—`)
-- Skip `cost_per_min` and `high_burn` (treat as unknown)
-- `cost_per_min` in header and stats block = `—`
-- Add note in Performance section: `Cost: N/A (not reported by provider)`
+**If the LLM returns invalid JSON**, retry once. If it fails again, set tasks to `[]` and note: "Task segmentation failed — proceeding with session-level metrics only."
 
-**cost_usd** — if not `cost_unavailable`: sum `cost_usd` from `message_costs[]` within
-the task window. Otherwise `null`.
+**If the LLM returns `[]`** (no tasks detected), that's valid — some sessions are exploratory.
 
-**cost_per_min** — `cost_usd / (duration_ms / 60000)`. Flag `high_burn = true`
-if `cost_per_min > 2 × session_avg_cost_per_min` where
-`session_avg = stats.total_cost_usd / (session.duration_ms / 60000)`.
-Skip entirely when `cost_unavailable`.
+---
 
-**efficiency_pct** — among task commands, exclude read-only commands
-(`ls`, `cat`, `head`, `tail`, `echo`, `pwd`, `which`, `grep`, `find`, `rg`).
-Of remaining "meaningful" commands: `round(exit_0_count / total * 100)`.
-If no meaningful commands: `null` (display as `—`).
+## Phase 3 — Enrich with math
 
-**quality_score** — computed as the average of four dimensions (each 0–100):
+Now that you have task time ranges from Phase 2, compute per-task and session-level metrics.
+
+For each task, filter `commands[]` and `message_costs[]` by `start_time ≤ timestamp ≤ end_time`.
+
+### Cost signals
+
+**tokens_unavailable** — `true` if `stats.total_tokens == 0`. Display tokens as `N/A (not reported by provider)`.
+
+**cost_unavailable** — `true` if `message_costs[]` is empty OR all `cost_usd == 0`. When true:
+- All cost fields = `—`
+- Skip `cost_per_min` and `high_burn`
+
+**cost_usd** — sum `cost_usd` from `message_costs[]` within the task window.
+
+**cost_per_min** — `cost_usd / (duration_ms / 60000)`. Flag `high_burn = true` if `cost_per_min > 2 × session_avg`.
+
+### Efficiency
+
+**efficiency_pct** — exclude read-only commands (`ls`, `cat`, `head`, `tail`, `echo`, `pwd`, `which`, `grep`, `find`, `rg`). Of remaining: `round(exit_0_count / total × 100)`. No meaningful commands → `null` (display `—`).
+
+### Quality score (4 dimensions, 0–100 each)
 
 **dim_execution** — session-wide command success rate:
 ```
-meaningful = commands[] excluding (ls, cat, head, tail, echo, pwd, which, grep, find, rg)
-dim_execution = round(exit_0_count / len(meaningful) × 100) if meaningful else 100
+meaningful = commands[] excluding read-only (ls, cat, head, tail, echo, pwd, which, grep, find, rg)
+dim_execution = round(exit_0 / len(meaningful) × 100) if meaningful else 100
 ```
 
 **dim_completion** — task completion rate:
 ```
-dim_completion = round(completed_tasks / total_tasks × 100) if tasks else 100
+dim_completion = round(completed / total × 100) if tasks else 100
 ```
 
-**dim_depth** — maximum task complexity detected in commands[] text (take highest match):
+**dim_depth** — session-level structural complexity. Computed once, shared by all tasks.
+
 ```
-"util abi encode" OR "bridge" OR "layerzero" OR "cross-chain"  → 100
-"tx call" OR "contract"                                         → 80
-"pact submit"                                                   → 60
-"tx transfer"                                                   → 40
-"faucet" OR "onboard"                                          → 20
-(none of the above)                                            → 10
+⚠️ Normalise tool names before computing:
+  "exec" = "Bash", "read_file" = "Read", "write_file" = "Write",
+  "edit_file" = "Edit", "web_search" = "WebSearch", "web_fetch" = "WebFetch"
+
+A: tool_breadth (0–50)
+  tool_types = distinct normalised tool names in tool_usage
+  1 type   →  0  (but if len(commands[]) > 50: floor at 10)
+  2–3      → 20
+  4–5      → 35
+  6+       → 50
+
+B: external_call_density (0–25)
+  Count commands[] where command text contains "http://", "https://", or "api."
+  Exclude: "localhost", "127.0.0.1", "0.0.0.0"
+  Add normalised "WebFetch" + "WebSearch" from tool_usage (deduplicate)
+  0    →  0
+  1–5  → 15
+  6+   → 25
+
+C: write_ratio (0–25)
+  write_calls = normalised tool_usage["Write"] + ["Edit"]
+  total_calls = sum(tool_usage.values())
+  ratio = write_calls / total_calls if total > 0 else 0
+  < 0.10   →  0
+  0.10–0.30 → 15
+  > 0.30   → 25
+
+dim_depth = min(100, A + B + C)
+
+depth_label:
+  types ≥ 5, ext ≥ 6  → "deep integration"
+  types ≥ 5, write > 0.30  → "heavy authoring"
+  types ≥ 5             → "multi-tool"
+  types ≥ 4, ext ≥ 1   → "multi-tool + external"
+  types ≥ 4             → "multi-tool"
+  types 2–3, write > 0.10 → "read-write"
+  types 2–3             → "basic ops"
+  types = 1             → "read-only"
 ```
 
 **dim_ux** — user experience smoothness:
 ```
 dim_ux = 100
-- confirmed context_loss (Phase 4 thinking confirmed): -10 each, capped at -30
-- abandoned tasks: -8 each, capped at -20
-- error_loop with count > 10: -15 each, capped at -30   (large unexplained loops)
-- error_loop with 3 ≤ count ≤ 10: -5 each, capped at -20
-Note: polling_loop and exploration_loop do NOT affect dim_ux.
-dim_ux = max(dim_ux, 0)
+  - confirmed context_loss: -10 each, cap -30
+  - abandoned tasks: -8 each, cap -20
+  - error_loop count > 10: -15 each, cap -30
+  - error_loop 3–10: -5 each, cap -20
+  ⚠️ polling_loop and exploration_loop do NOT affect dim_ux.
+dim_ux = max(0, dim_ux)
 ```
 
+**Final score:**
 ```
 quality_score = round((dim_execution + dim_completion + dim_depth + dim_ux) / 4)
+Grade: 90–100 = A, 75–89 = B, 60–74 = C, 45–59 = D, <45 = F
 ```
-Grade: 90–100 = A, 75–89 = B, 60–74 = C, 45–59 = D, <45 = F.
 
-If no tasks detected: `dim_completion = 100`. Replace `dim_depth` with:
-```
-dim_depth = 10 + (15 if tool_errors/tool_calls < 0.3 else 0)
-```
-Note in report: "score based on session-level signals — no tasks detected."
+If no tasks detected: `dim_completion = 100`. Note in report: "score based on session-level signals — no tasks detected."
+
+### Additional metrics (from parser output)
+
+The parser also outputs three operational metrics. You read them directly from the JSON — no computation needed:
+
+**`wasted_calls`** — unnecessary CLI invocations (blind retries, help exploration, version checks, flag trial-and-error, env probing). Key fields: `waste_ratio`, `total`, `by_type`, `details[]`.
+
+**`recovery`** — for each failed operation, did the same operation succeed within 2 subsequent attempts? Key fields: `recovery_rate`, `resolved`, `unresolved`, `correctly_abandoned`, `details[]`.
+
+**`hallucinations`** — completion claims that contradict recent command results (agent says "done ✅" but last command failed). Key fields: `hallucination_rate`, `total_claims`, `hallucinations`, `details[]`.
 
 ---
 
-### Phase 3 — LLM segmentation
+## Phase 4 — Targeted thinking analysis (conditional)
 
-Make one internal LLM call to segment the conversation into tasks.
-
-**Task definition:** A task requires a clear actionable goal delegated to the agent.
-Casual questions, clarifications, small talk are NOT tasks. Task durations need not
-cover the full session.
-
-**Transcript formatting:** Format `conversation[]` as `[HH:MM] ROLE: text`.
-Truncate: user turns at 400 chars, assistant turns at 600 chars. If total transcript
-exceeds 20 000 chars, reduce to 300/350. Always preserve the last user message in full.
-If >80 turns: keep all user turns, keep every other assistant turn, always keep last 10
-turns. Add note: "transcript thinned — some assistant turns omitted."
-
-**Prompt:**
-```
-Below is a transcript of a Claude Code session with timestamps.
-
-TASK SEGMENTATION:
-Identify the distinct tasks the user was working on. A task must have a clear,
-actionable goal delegated to the agent. Do NOT create tasks for casual questions,
-clarifications, or acknowledgements. Not all turns need to belong to a task.
-Prefer fewer, broader tasks over over-splitting.
-
-A new task starts when the user shifts to a clearly different actionable goal.
-Retries, corrections, and follow-ups within the same goal are part of the same task.
-Task time ranges must be non-overlapping. If two tasks share a boundary, end the
-earlier task at the timestamp where the new one begins.
-
-CONTEXT LOSS:
-For each task, identify "repeated_question" signals only: cases where the agent
-asked the user for the same information more than once within this task.
-
-For each task output:
-- index (1-based integer)
-- title (short verb phrase, ≤8 words)
-- start_time, end_time (ISO timestamps; non-overlapping)
-- status: "completed" | "abandoned" | "unclear"
-- context_loss: array of {type, description}, or []
-
-Return JSON array only, no prose. Return [] if no clear tasks found.
-
-TRANSCRIPT:
-<formatted transcript>
-```
-
-After Phase 3 returns, immediately run Phase 2 per-task enrichment to attach
-`cost_usd`, `cost_per_min`, `high_burn`, `efficiency_pct` to each task.
-Then compute `quality_score` and `quality_grade`.
-
----
-
-### Phase 4 — Targeted thinking analysis (conditional)
-
-Skip entirely if either condition is false:
+**Skip entirely unless BOTH conditions are true:**
 1. `thinking[]` is non-empty
 2. At least one of:
    - any `error_loop` with `count > 10`
    - any task `status == "abandoned"`
    - any task `context_loss` non-empty
 
-Do NOT trigger for: `polling_loop`, `exploration_loop`, or `error_loop` with `count ≤ 10`
-(root cause is usually evident from error_text alone).
+❌ Do NOT trigger for: `polling_loop`, `exploration_loop`, or `error_loop` with `count ≤ 10`.
 
-**Cap: max 3 LLM calls.** Priority when >3 triggers: abandoned tasks first, then loops, then context loss.
+**Cap: max 3 LLM calls.** Priority: abandoned tasks → loops → context loss.
 
-For each trigger, extract `thinking[]` entries in the relevant time range and make a focused call:
+**Read prompt templates from:** `references/prompts.md` → "Thinking Analysis Prompts"
 
-**Loop trigger:**
-```
-The agent repeated "<command_normalized>" × N times between <start> and <end>.
-Below are the agent's thinking blocks during this period.
-In 1–2 sentences: why did the agent keep repeating this? Was it aware of the loop?
-
-<thinking entries>
-```
-
-**Abandoned task trigger:**
-```
-The agent was working on "<title>" but did not complete it.
-Below are the agent's last 3 thinking blocks before the task ended.
-In 1–2 sentences: what caused the agent to stop?
-
-<last 3 thinking entries before end_time>
-```
-
-**Context loss trigger:**
-```
-The agent showed signs of context loss during "<title>": <description>.
-Below are relevant thinking blocks.
-In 1–2 sentences: does the thinking confirm genuine context loss or intentional re-check?
-
-<thinking entries in task time range>
-```
-
-Store each result as `root_cause` on the relevant loop or task object.
+Store each result as `root_cause` on the relevant loop or task.
 
 ---
 
-### Phase 5 — Display stats and ask questions
+## Phase 5 — Display stats and ask questions
 
-**Skip questions if `--silent` flag was passed.** Display the stats block either way, then in silent mode proceed directly to Phase 7.
+**If `--silent` was passed**, display the stats block then skip to Phase 7.
 
-Display the following block:
+### Stats block
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -226,197 +230,79 @@ Date:    <session.start_time>
 Model:   <session.model> (<session.provider>)
 User:    <session.user>
 CWD:     <session.cwd>
-Duration: <session.duration_ms as Xm Ys>
+Duration: <Xm Ys>
 
-Quality: <quality_score>/100 (<quality_grade>)  ·  <N completed>/<N total> tasks  ·  <$X.XX/min or "—" if cost_unavailable>/min
+Quality: <score>/100 (<grade>)  ·  <N>/<N> tasks  ·  <$X.XX/min or "—">/min
   Execution  <bar>  <dim_execution>
   Completion <bar>  <dim_completion>
-  Depth      <bar>  <dim_depth>  (<label: e.g. "cross-chain" or "transfer only">)
+  Depth      <bar>  <dim_depth>  (<depth_label>)
   UX         <bar>  <dim_ux>
-(bar = "█"×round(score/10) + "░"×(10−round(score/10)))
+(bar = "█" × round(score/10) + "░" × (10 − round(score/10)))
 
 Stats
-  Turns: <stats.total_turns>  Tool calls: <stats.tool_calls>  Errors: <stats.tool_errors>
-  Tokens: <stats.total_tokens or "N/A (not reported by provider)" if tokens_unavailable>  Cost: <$X.XX or "N/A (not reported by provider)" if cost_unavailable>
+  Turns: <total_turns>  Tool calls: <tool_calls>  Errors: <tool_errors>
+  Tokens: <total_tokens or "N/A">  Cost: <$X.XX or "N/A">
 
 Timing
-  LLM:   <timing.llm_ms as Xm Ys>  (<timing.llm_pct>%)  avg <timing.llm_avg_ms>ms  max <timing.llm_max_ms>ms
-  CLI:   <timing.cli_ms as Xm Ys>  (<timing.cli_pct>%)  avg <timing.cli_avg_ms>ms  max <timing.cli_max_ms>ms
-  User:  <timing.user_ms as Xm Ys>  (<timing.user_pct>%)
-  Idle:  <timing.idle_ms as Xm Ys>  (<timing.idle_pct>%)
+  LLM:   <Xm Ys>  (<pct>%)  avg <avg>ms  max <max>ms
+  CLI:   <Xm Ys>  (<pct>%)  avg <avg>ms  max <max>ms
+  User:  <Xm Ys>  (<pct>%)
+  Idle:  <Xm Ys>  (<pct>%)
 
 Tasks detected: <N>  (covers <Xm> of <Ym session>)
-<for each task: "  N. <title>  HH:MM→HH:MM  Xm  $X.XXX  eff:XX%  [x]/[ ] [⚠ high burn]">
+  N. <title>  HH:MM→HH:MM  Xm  $X.XXX  eff:XX%  [x]/[ ] [⚠ high burn]
 
 Loops detected: <count>
-<for each loop: "  • <command_normalized> × <count> (<loop_type>) — <duration as Xm Ys>">
+  • <command_normalized> × <count> (<loop_type>) — <Xm Ys>
+
+Operational Metrics
+  Waste:         <waste_ratio>% (<total>/<cmds> — <by_type summary>)
+  Recovery:      <recovery_rate>% (<resolved> resolved, <unresolved> unresolved, <correctly_abandoned> abandoned)
+  Hallucination: <hallucinations>/<total_claims> claims (<hallucination_rate>%) [🚨 if > 0]
 
 Errors: <count>
-<for each error (max 5): "  • [<exit_code>] <command truncated to 60 chars>">
+  • [<exit_code>] <command truncated to 60 chars>
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-Then ask questions **one at a time**, waiting for each answer. Pick top 2–5 from this
-priority pool (never exceed 5):
+### Questions
 
-1. Abandoned task: "Task N ('[title]') appears abandoned. What happened?"
-2. Error loop (error_loop only, NOT polling_loop or exploration_loop): "The agent repeated `<cmd>` × N times. Was this expected or a bug?"
-3. Low efficiency (<50%): "Task N had a X% command success rate. Was the agent struggling?"
-4. High burn: "Task N cost $X in Nm — above session average. Was this expected?"
-5. Context loss: "Task N shows context loss: [description]. Did you notice the agent losing track?"
-6. (fallback if none above): "What was the goal of this session, and was it achieved?"
+Ask **one at a time**, wait for each answer. Pick top 2–5 from this priority pool:
+
+1. 🔴 Abandoned task: "Task N ('[title]') appears abandoned. What happened?"
+2. 🔴 Error loop (error_loop only): "The agent repeated `<cmd>` × N times. Was this expected or a bug?"
+3. 🟡 Low efficiency (<50%): "Task N had X% command success rate. Was the agent struggling?"
+4. 🟡 High burn: "Task N cost $X in Nm — above session average. Was this expected?"
+5. 🟡 Context loss: "Task N shows context loss: [desc]. Did you notice the agent losing track?"
+6. ⚪ Fallback: "What was the goal of this session, and was it achieved?"
 
 ---
 
-### Phase 6 — Collect answers
+## Phase 6 — Collect answers
 
 Hold all answers in conversation context. Do not write to any file.
 
-**Skip if `--silent` flag was passed.**
+**Skip if `--silent` was passed.**
 
 ---
 
-### Phase 7 — Generate and write the report
+## Phase 7 — Write the report
 
-Write the report to:
-```
-<absolute_directory_of_input_file>/<input_filename_without_extension>_analysis.md
-```
+**Read the full report template from:** `references/report-template.md`
 
-If `--since` or `--until` was passed, include the range in the filename:
-```
-<stem>_14h30-16h00_analysis.md
-```
-
-**Report structure:**
-
-```markdown
-# Session Analysis: <session.id>
-
-**Quality: <score>/100 (<grade>)**  ·  <N>/<N> tasks  ·  <$X.XX/min or "—" if cost_unavailable>/min
-```
-  Execution  <bar>  <dim_execution>
-  Completion <bar>  <dim_completion>
-  Depth      <bar>  <dim_depth>  (<depth label>)
-  UX         <bar>  <dim_ux>
-```
-**Date:** <date> | **Model:** <model> | **Duration:** <Xm Ys>
-**User:** <user> | **CWD:** <cwd>
-[> *Generated in silent mode — no user input collected.*]
-[> *Time window: <HH:MM>–<HH:MM> — quality score covers this window only, not the full session.*  (include only when --since or --until was passed)]
+**Generate narrative sections** (Summary + UX Friction Points) with one LLM call. **Read the prompt from:** `references/prompts.md` → "Narrative Sections Prompt"
 
 ---
 
-## Summary
-<LLM-generated — see prompt below>
+## ⚠️ Troubleshooting
 
-## Task Breakdown
-| # | Task | Duration | Cost | Efficiency | Status |
-|---|------|----------|------|------------|--------|
-<one row per task; cost = "—" when cost_unavailable; ⚠ on cost if high_burn; efficiency = "—" for null>
-
-<if high_burn: "> ⚠ Task N: high token burn rate ($X/min vs avg $X/min)">
-<if cost_unavailable: "> ⚠ Cost data unavailable — provider did not report token costs for this session.">
-
-## Conversation Log
-<for each entry in conversation[]: "[HH:MM] ROLE: text truncated at 120 chars">
-(Tool calls and tool results are not shown here.)
-
-## UX Friction Points
-<LLM-generated — see prompt below>
-
-## Agent Anomalies
-
-### Loops
-<table if loops exist, else "None detected.">
-| Normalized Command | Type | Count | Duration | Period | Root Cause |
-|--------------------|------|-------|----------|--------|------------|
-
-### Errors
-<table if errors exist, else "None.">
-| Time | Command | Exit Code | Error (first 80 chars) |
-|------|---------|-----------|------------------------|
-
-### Tool Usage
-| Tool | Calls |
-|------|-------|
-
-## Command Log
-<partitioned by task if tasks detected; flat list otherwise>
-
-### Task N — <title>
-| Time | Command | Status | Duration |
-
-### Other
-| Time | Command | Status | Duration |
-
-Duration for each row must be taken from `duration_ms` in `commands[]`, formatted as:
-- <1000ms → show as `Xms` (e.g. `33ms`)
-- ≥1000ms → show as `Xs` or `Xm Ys` (e.g. `10s`, `1m 35s`)
-- When multiple repeated commands are collapsed into one row (e.g. `×10`), show the sum as `~Xs` or `~Xm Ys`
-- Write `—` only if the command has no matching entry in `commands[]`
-
-## Performance & Timing
-
-**Total duration:** <Xm Ys>
-
-| Type | Total | % | Avg | Max |
-|------|-------|---|-----|-----|
-| LLM inference | <llm_ms as Xm Ys> | <pct>% | <avg>ms | <max>ms |
-| CLI execution | <cli_ms as Xm Ys> | <pct>% | <avg>ms | <max>ms |
-| User response | <user_ms as Xm Ys> | <pct>% | — | — |
-| Idle / other  | <idle_ms as Xm Ys> | <pct>% | — | — |
-
-**Tokens:** <total_tokens> | **Cost:** <$X.XX | "N/A (not reported by provider)" if cost_unavailable>
-
-## Systemic Issues
-<only include if any error matches a known pattern below; omit section entirely if none>
-Flag these patterns from `errors[]`:
-- `error_text` contains "deprecated"                  → ⚠️ API deprecation (known CLI flag change)
-- `error_text` contains "CORE_API_12007"              → ⚠️ Missing --src-addr (recurring pattern)
-- `error_text` contains "cannot be combined"          → ⚠️ CLI flag conflict (--spec-json + --permissions)
-- `error_text` contains "403" AND "policy"            → ⚠️ Agent permission boundary (policy management requires owner)
-- `error_text` contains "pacts:write"                 → ⚠️ Missing pacts:write scope (Option B onboarding API key may not include this scope — known bug)
-
-For each match, output one line: `- **[pattern name]:** <command truncated to 60 chars> — <brief explanation>`
-```
-
-**LLM call for narrative sections** — make one call to generate Summary and UX Friction Points:
-
-```
-You are writing two sections of a session analysis report.
-
-SESSION DATA:
-- Quality: <score>/100 (<grade>)<quality_note if no tasks>
-- Tasks: <N completed> completed, <N abandoned> abandoned
-- Loops: <list with type and count, or "none">
-- Error rate: <tool_errors>/<tool_calls> commands failed
-- User answers: <answers, or "none — silent mode">
-
-TASKS:
-<task list: index, title, status, efficiency_pct, high_burn, context_loss, root_cause>
-
-WRITE:
-
-## Summary
-3–5 sentences. Cover: (1) what the user was trying to accomplish; (2) what the
-agent did; (3) overall outcome referencing quality score. Do not list tasks.
-If silent mode, note where intent was inferred rather than stated.
-
-## UX Friction Points
-Bullet points for friction only. Per bullet: **Task N [type]:** description.
-Add > *Thinking: root_cause* blockquote if available.
-Incorporate user answers where relevant.
-Write "None detected." if nothing to report.
-Do not invent friction points — only report what the data shows.
-Signals to cover in order: context_loss, low efficiency (<50%), error_loops (NOT polling_loop or exploration_loop), high_burn.
-Skip signals the user confirmed were expected.
-```
-
-After writing the report, print:
-```
-✓ Report written to <output_path>
-  Quality: <score>/100 (<grade>)  ·  <N>/<N> tasks  ·  $<X.XX>/min
-  Key issue: <most prominent error_loop or error, or "None detected">
-  Duration breakdown: LLM <pct>% / CLI <pct>% / User <pct>% / Idle <pct>%
-```
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| `Parser not found` | Skill not installed | `pip install` or clone repo |
+| Parser exits with `JSONDecodeError` | Not a valid JSONL file | Check the file is one-JSON-per-line |
+| Parser exits with `KeyError: 'type'` | Unsupported JSONL format | Only OpenClaw and Claude Code CLI formats are supported |
+| Phase 2 returns invalid JSON | LLM parsing error | Retry once; if still fails, proceed with `tasks = []` |
+| All dim_depth values are low (10–20) | CLI-heavy session (all work in Bash) | Expected — structural signals measure tool diversity, not command complexity |
+| `cost_unavailable` / all costs `—` | Provider didn't report token costs | Not a bug; display as N/A |
+| Session has >500 commands | Very long session | Parser handles it, but Phase 2 transcript may be thinned |
+| `--since`/`--until` returns empty | Time range doesn't overlap session | Check timestamps are in HH:MM local time matching session timezone |

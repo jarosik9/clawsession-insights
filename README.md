@@ -1,8 +1,11 @@
 # clawsession-insights
 
-A Claude Code skill that analyzes [OpenClaw](https://github.com/jarosik9/openclaw) session logs and produces a structured Markdown report.
+A Claude Code skill that analyzes session logs and produces a structured Markdown report. Supports three session formats:
+- **OpenClaw** JSONL logs
+- **Claude Code CLI** JSONL logs
+- **Langfuse trace** JSON arrays
 
-Point it at a `.jsonl` session file and get a breakdown of what the agent did, where it got stuck, how time was spent, and what it cost.
+Point it at a session file (`.jsonl` or `.json`) and get a breakdown of what the agent did, where it got stuck, how time was spent, and what it cost.
 
 ---
 
@@ -41,9 +44,12 @@ The skill then asks 2–3 targeted questions based on what it found (loops, high
 
 ## Requirements
 
-- Python 3 (stdlib only, no extra packages)
+- Python 3.10+ (stdlib only, no extra packages)
 - Claude Code with skill support
-- Session `.jsonl` files exported from [OpenClaw](https://github.com/jarosik9/openclaw)
+- Session files in one of these formats:
+  - OpenClaw JSONL (`.jsonl`)
+  - Claude Code CLI JSONL (`.jsonl`)
+  - Langfuse trace JSON array (`.json`)
 
 ---
 
